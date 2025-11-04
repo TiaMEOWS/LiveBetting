@@ -1,0 +1,130 @@
+========================================
+24/7 LIVE BETTING ANALYSIS SYSTEM
+Quick Setup & Operation Guide
+========================================
+
+SYSTEM OVERVIEW
+---------------
+Professional football betting analysis system that:
+✓ Scans live matches 24/7 (60-72 minute window)
+✓ Identifies matches likely to have ≤1 additional goal
+✓ Sends alerts to your Telegram bot
+✓ Prevents duplicate alerts (24-hour memory)
+✓ Optimized API usage (7,500 requests/day limit)
+
+QUICK START
+-----------
+1. Double-click "start.bat" to run the system
+   OR
+2. Open PowerShell/CMD in this folder and run:
+   python main.py
+
+SYSTEM FEATURES
+---------------
+✓ Smart Scanning:
+  - Peak hours (08:00-01:00 UTC): Every 5 minutes
+  - Off-peak hours: Every 10 minutes
+  - Adjusts based on match density
+
+✓ Duplicate Prevention:
+  - Tracks all analyzed matches for 24 hours
+  - Never re-alerts the same match
+  - Automatic cleanup of old data
+
+✓ API Optimization:
+  - Daily budget: 7,500 requests → ~312/hour
+  - Emergency throttling when quota is low
+  - Exponential backoff on errors
+
+✓ Analysis Criteria (Need 4/6 + xG checks):
+  1. Total shots ≤ 12
+  2. Shots on target ≤ 4
+  3. Last 15min shots ≤ 3
+  4. Corners ≤ 5
+  5. Possession diff ≤ 15%
+  6. No red cards/penalties
+  
+  PLUS:
+  - Combined xG < 2.0
+  - Second half xG < 0.4
+  - Both teams npxG < 1.3 (last 5 matches)
+  - H2H average < 2.0 goals
+
+TELEGRAM ALERTS
+---------------
+You'll receive:
+✓ Match alerts when qualifications are found
+✓ Duplicate skip notifications
+✓ Hourly status reports
+✓ API quota warnings
+✓ Error notifications
+
+CONFIGURATION
+-------------
+Edit config.py to customize:
+- Scan intervals
+- Analysis thresholds
+- Priority leagues
+- API limits
+
+FILES CREATED DURING OPERATION
+-------------------------------
+- match_tracking.json : Database of analyzed matches
+- betting_system.log  : Main system log (rotating, max 10MB)
+- errors.log          : Error-specific log (rotating, max 5MB)
+
+MONITORING
+----------
+The system will:
+✓ Send startup notification when launched
+✓ Report status every hour
+✓ Warn when API quota is running low
+✓ Alert on critical errors
+✓ Log all activity to files
+
+STOPPING THE SYSTEM
+-------------------
+Press CTRL+C in the terminal window
+
+API USAGE ESTIMATE
+------------------
+Base scans/day: 288 (every 5 min) = ~288 requests
+Per qualifying match: +3-5 requests (stats, events, form)
+Expected daily usage: 500-1,500 requests
+Safety buffer: 6,000+ requests remaining
+
+TROUBLESHOOTING
+---------------
+Q: No alerts being sent?
+A: Check that matches are actually in 60-72 min window
+   and meet the strict criteria (low xG, defensive stats)
+
+Q: Too many duplicate skip messages?
+A: This is normal - prevents re-analyzing same matches
+
+Q: API quota warning?
+A: System will automatically throttle. Wait for daily reset.
+
+Q: Connection errors?
+A: System will retry with exponential backoff automatically
+
+SYSTEM ARCHITECTURE
+-------------------
+main.py              → Entry point
+live_scanner.py      → 24/7 scanning engine
+match_analyzer.py    → Analysis logic (xG, criteria)
+api_client.py        → API-Football integration
+match_tracker.py     → Duplicate prevention database
+telegram_notifier.py → Telegram bot messaging
+logger_config.py     → Logging & error monitoring
+config.py            → Configuration settings
+
+SUPPORT
+-------
+System logs all activity to betting_system.log
+Check errors.log for detailed error information
+All match decisions are logged with reasoning
+
+========================================
+System is ready! Run start.bat to begin.
+========================================

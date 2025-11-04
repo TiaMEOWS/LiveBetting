@@ -1,0 +1,8 @@
+# HTTP Requests for API calls and Telegram
+requests>=2.31.0,<3.0.0
+
+# Optional: For better JSON handling (already in Python stdlib)
+# python-dateutil>=2.8.2
+
+# Optional: For enhanced logging (already in Python stdlib)
+# colorlog>=6.7.0
