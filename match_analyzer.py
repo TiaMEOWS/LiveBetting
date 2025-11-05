@@ -15,7 +15,133 @@ class MatchAnalyzer:
         self.api_client = api_client
         self.logger = logging.getLogger(__name__)
         self.analysis_cache = {}  # Cache: fixture_id -> {score, minute, last_event, confidence}
-    
+
+    # ------------------------------------------------------------------
+    # Helper utilities
+    # ------------------------------------------------------------------
+
+    def score_band(self, value: float, bands: List[Tuple[float, int]], default: int = 0) -> int:
+        """Return banded score for a metric (lower values earn more points)."""
+        for threshold, points in bands:
+            if value <= threshold:
+                return points
+        return default
+
+    def is_shot_event(self, event: Dict) -> bool:
+        """Heuristic to detect shot attempts from event feed."""
+        event_type = str(event.get('type', '')).lower()
+        detail = str(event.get('detail', '')).lower()
+        return (
+            'shot' in event_type
+            or 'shot' in detail
+            or 'goal' in detail
+            or event_type == 'goal'
+        )
+
+    def is_shot_on_target_event(self, event: Dict) -> bool:
+        """Detect on-target attempts (goals, clear chances)."""
+        detail = str(event.get('detail', '')).lower()
+        event_type = str(event.get('type', '')).lower()
+        return (
+            'goal' in detail
+            or 'shot on target' in detail
+            or (event_type == 'goal')
+            or ('penalty' in detail and 'missed' not in detail)
+        )
+
+    def parse_numeric_value(self, value) -> Optional[float]:
+        """Safely parse numeric values that may come as strings or percentages."""
+        if value in (None, 'N/A'):
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        try:
+            cleaned = str(value).replace('%', '').strip()
+            if not cleaned:
+                return None
+            return float(cleaned)
+        except (TypeError, ValueError):
+            return None
+
+    def count_events_in_range(
+        self,
+        events: List[Dict],
+        start_minute: int,
+        end_minute: int,
+        predicate,
+    ) -> int:
+        """Count events that satisfy predicate within [start_minute, end_minute]."""
+        if not events:
+            return 0
+
+        start = max(0, start_minute)
+        end = max(start, end_minute)
+        total = 0
+
+        for event in events:
+            event_minute = event.get('time', {}).get('elapsed')
+            if event_minute is None:
+                continue
+            if start <= event_minute <= end and predicate(event):
+                total += 1
+
+        return total
+
+    def calculate_tempo_metrics(self, events: List[Dict], minute: int) -> Dict:
+        """Summarise recent tempo/pressure indicators from event feed."""
+        window_start = minute - 12
+        dangerous_actions = self.count_events_in_range(
+            events,
+            window_start,
+            minute,
+            self.is_shot_event,
+        )
+        pressure_events = self.count_events_in_range(
+            events,
+            window_start,
+            minute,
+            lambda e: str(e.get('detail', '')).lower() in ['corner', 'dangerous attack']
+            or 'free kick' in str(e.get('detail', '')).lower(),
+        )
+        cards_recent = self.count_events_in_range(
+            events,
+            window_start,
+            minute,
+            lambda e: 'card' in str(e.get('detail', '')).lower(),
+        )
+        tempo_minutes = max(1, minute - max(0, window_start))
+
+        tempo_index = (dangerous_actions + 0.6 * pressure_events) / tempo_minutes
+        xg_slope = self.calculate_xg_slope(events, minute)
+
+        return {
+            'window_minutes': tempo_minutes,
+            'dangerous_actions': dangerous_actions,
+            'pressure_events': pressure_events,
+            'cards_recent': cards_recent,
+            'tempo_index': round(tempo_index, 3),
+            'xg_slope': xg_slope,
+        }
+
+    def calculate_risk_index(self, tempo_metrics: Dict) -> float:
+        """Aggregate tempo metrics into a 0-1 risk score."""
+        tempo_score = min(1.0, tempo_metrics['dangerous_actions'] / max(1, config.RISK_DANGEROUS_ACTIONS_CAP))
+        pressure_score = min(1.0, tempo_metrics['pressure_events'] / max(1, config.RISK_PRESSURE_EVENTS_CAP))
+        card_score = min(1.0, tempo_metrics['cards_recent'] / max(1, config.RISK_CARD_EVENTS_CAP))
+        slope_raw = max(0.0, tempo_metrics['xg_slope'])
+        slope_score = min(1.0, slope_raw / max(0.01, config.RISK_SLOPE_CAP))
+
+        risk_index = (
+            tempo_score * config.RISK_TEMPO_WEIGHT
+            + pressure_score * config.RISK_PRESSURE_WEIGHT
+            + card_score * config.RISK_CARD_WEIGHT
+            + slope_score * config.RISK_XG_SLOPE_WEIGHT
+        )
+
+        return round(min(1.0, risk_index), 3)
+
     def extract_statistic(self, stats: List[Dict], stat_name: str, team_index: Optional[int] = None) -> Optional[int]:
         """
         Extract specific statistic from API response
@@ -60,50 +186,68 @@ class MatchAnalyzer:
         
         return None
     
-    def calculate_xg_from_stats(self, stats: List[Dict]) -> Tuple[float, float]:
+    def calculate_xg_from_stats(self, stats: List[Dict]) -> Tuple[float, float, Tuple[float, float]]:
         """
         Calculate approximate xG from available statistics
-        
+
         Returns:
-            (combined_xg, second_half_xg) tuple
+            (combined_xg, second_half_xg, (home_xg, away_xg)) tuple
         """
         if not stats or len(stats) < 2:
-            return 0.0, 0.0
-        
+            return 0.0, 0.0, (0.0, 0.0)
+
         total_xg = 0.0
-        
+        team_xg_values: List[float] = []
+
         for team_stats in stats:
             team_stat_list = team_stats.get('statistics', [])
-            
+
             shots_on_target = 0
             total_shots = 0
-            
+            team_xg = None
+
             for stat in team_stat_list:
-                stat_type = stat.get('type')
+                stat_type = str(stat.get('type', '')).strip()
                 value = stat.get('value')
-                
-                if value and value != 'N/A':
-                    str_val = str(value).replace('%', '')
-                    if stat_type == 'Shots on Goal' and str_val.isdigit():
-                        shots_on_target = int(str_val)
-                    elif stat_type == 'Total Shots' and str_val.isdigit():
-                        total_shots = int(str_val)
-            
-            # xG estimation: shots_on_target * 0.35 + off_target_shots * 0.05
-            off_target = max(0, total_shots - shots_on_target)
-            team_xg = (shots_on_target * 0.35) + (off_target * 0.05)
+                numeric_value = self.parse_numeric_value(value)
+
+                if numeric_value is None:
+                    continue
+
+                stat_key = stat_type.lower()
+                if stat_key in {'expected goals', 'expected_goals', 'xg'}:
+                    team_xg = numeric_value
+                elif stat_type == 'Shots on Goal':
+                    shots_on_target = int(round(numeric_value))
+                elif stat_type == 'Total Shots':
+                    total_shots = int(round(numeric_value))
+
+            if team_xg is None:
+                # xG estimation: shots_on_target * 0.35 + off_target_shots * 0.05
+                off_target = max(0, total_shots - shots_on_target)
+                team_xg = (shots_on_target * 0.35) + (off_target * 0.05)
+
             total_xg += team_xg
-        
-        # Second half xG estimate (40% of total)
-        second_half_xg = total_xg * 0.4
-        
-        return round(total_xg, 2), round(second_half_xg, 2)
-    
-    def calculate_match_score(self, stats: List[Dict], events: List[Dict], 
-                              goals_data: Dict, minute: int, home_xg: float, away_xg: float) -> Tuple[int, Dict, str]:
+            team_xg_values.append(round(team_xg, 2))
+
+        if len(team_xg_values) < 2:
+            # Fallback: split evenly if we could not resolve each team separately
+            even_split = round(total_xg / max(1, len(team_xg_values) or 1), 2)
+            while len(team_xg_values) < 2:
+                team_xg_values.append(even_split)
+
+        # Second half xG estimate (weighted towards live action)
+        second_half_xg = total_xg * 0.35
+
+        return round(total_xg, 2), round(second_half_xg, 2), (team_xg_values[0], team_xg_values[1])
+
+    def calculate_match_score(self, stats: List[Dict], events: List[Dict],
+                              goals_data: Dict, minute: int,
+                              combined_xg: float, second_half_xg: float,
+                              team_xg_split: Tuple[float, float]) -> Tuple[int, Dict, str]:
         """
         Calculate match score based on 30-point system (S1-S5)
-        
+
         Returns:
             (total_score, score_breakdown, bonus_tag)
         """
@@ -111,94 +255,97 @@ class MatchAnalyzer:
         breakdown = {}
         bonus_tag = ""
         penalties = 0  # Penalty points (negative)
-        
+
         if not stats or len(stats) < 2:
             return 0, breakdown, bonus_tag
-        
+
+        # Event-derived counters for dynamic scoring
+        second_half_shots = self.count_events_in_range(events, 45, minute, self.is_shot_event)
+        second_half_sot = self.count_events_in_range(events, 45, minute, self.is_shot_on_target_event)
+        last_15min_shots = self.count_events_in_range(events, minute - 15, minute, self.is_shot_event)
+        second_half_corners = self.count_events_in_range(
+            events,
+            45,
+            minute,
+            lambda e: str(e.get('detail', '')).lower() == 'corner',
+        )
+
         # ============ SECTION 1: MATCH-WIDE CRITERIA (Max 9 points) ============
-        
+
         # 1.1 Total xG ≤2.2 (+3 points)
-        combined_xg, _ = self.calculate_xg_from_stats(stats)
-        if combined_xg <= config.MAX_COMBINED_XG:
-            score += 3
-            breakdown['total_xg'] = 3
-        else:
-            breakdown['total_xg'] = 0
-        
+        xg_points = self.score_band(combined_xg, [(1.6, 3), (1.9, 2), (config.MAX_COMBINED_XG, 1)])
+        score += xg_points
+        breakdown['total_xg'] = xg_points
+
         # 1.2 Total shots ≤14 (+2 points)
         total_shots = self.extract_statistic(stats, 'Total Shots') or 0
-        if total_shots <= config.MAX_TOTAL_SHOTS:
-            score += 2
-            breakdown['total_shots'] = 2
-        else:
-            breakdown['total_shots'] = 0
-        
+        total_shots_points = self.score_band(total_shots, [(10, 2), (config.MAX_TOTAL_SHOTS, 1)])
+        score += total_shots_points
+        breakdown['total_shots'] = total_shots_points
+
         # 1.3 Total shots on target ≤5 (+2 points)
         shots_on_target = self.extract_statistic(stats, 'Shots on Goal') or 0
-        if shots_on_target <= config.MAX_SHOTS_ON_TARGET:
-            score += 2
-            breakdown['shots_on_target'] = 2
-        else:
-            breakdown['shots_on_target'] = 0
-        
+        shots_on_target_points = self.score_band(shots_on_target, [(3, 2), (config.MAX_SHOTS_ON_TARGET, 1)])
+        score += shots_on_target_points
+        breakdown['shots_on_target'] = shots_on_target_points
+
         # 1.4 Total corners ≤7 (+1 point)
         total_corners = self.extract_statistic(stats, 'Corner Kicks') or 0
-        if total_corners <= config.MAX_CORNERS:
-            score += 1
-            breakdown['corners'] = 1
-        else:
-            breakdown['corners'] = 0
-        
+        corners_points = self.score_band(total_corners, [(4, 1), (config.MAX_CORNERS, 1)]) if total_corners <= config.MAX_CORNERS else 0
+        score += corners_points
+        breakdown['corners'] = corners_points
+
         # 1.5 Possession difference ≤18% (+1 point)
         home_poss = self.extract_statistic(stats, 'Ball Possession', 0) or 50
         away_poss = self.extract_statistic(stats, 'Ball Possession', 1) or 50
         poss_diff = abs(home_poss - away_poss)
-        if poss_diff <= config.MAX_POSSESSION_DIFF:
-            score += 1
-            breakdown['possession_diff'] = 1
-        else:
-            breakdown['possession_diff'] = 0
+        poss_points = self.score_band(poss_diff, [(10, 1), (config.MAX_POSSESSION_DIFF, 1)]) if poss_diff <= config.MAX_POSSESSION_DIFF else 0
+        score += poss_points
+        breakdown['possession_diff'] = poss_points
         
         # ============ SECTION 2: SECOND HALF CRITERIA (Max 11 points) ============
         
         # 2.1 2nd half xG ≤0.6 (+3 points)
-        _, second_half_xg = self.calculate_xg_from_stats(stats)
-        if second_half_xg <= config.MAX_SECOND_HALF_XG:
-            score += 3
-            breakdown['second_half_xg'] = 3
-        else:
-            breakdown['second_half_xg'] = 0
-        
-        # 2.2 2nd half shots ≤5 (+2 points) - estimate as 50% of total
-        second_half_shots = int(total_shots * 0.5)
-        if second_half_shots <= config.MAX_SECOND_HALF_SHOTS:
-            score += 2
-            breakdown['second_half_shots'] = 2
-        else:
-            breakdown['second_half_shots'] = 0
-        
+        second_half_xg_points = self.score_band(
+            second_half_xg,
+            [(0.35, 3), (0.5, 2), (config.MAX_SECOND_HALF_XG, 1)],
+        )
+        score += second_half_xg_points
+        breakdown['second_half_xg'] = second_half_xg_points
+
+        # 2.2 2nd half shots ≤5 (+2 points) - using live events when available
+        if second_half_shots == 0 and not events:
+            second_half_shots = int(total_shots * 0.45)
+        second_half_shots_points = self.score_band(
+            second_half_shots,
+            [(3, 2), (config.MAX_SECOND_HALF_SHOTS, 1)],
+        )
+        score += second_half_shots_points
+        breakdown['second_half_shots'] = second_half_shots_points
+
         # 2.3 2nd half shots on target ≤2 (+2 points)
-        second_half_sot = int(shots_on_target * 0.5)
-        if second_half_sot <= config.MAX_SECOND_HALF_SHOTS_ON_TARGET:
-            score += 2
-            breakdown['second_half_sot'] = 2
-        else:
-            breakdown['second_half_sot'] = 0
-        
+        if second_half_sot == 0 and not events:
+            second_half_sot = int(shots_on_target * 0.5)
+        second_half_sot_points = self.score_band(
+            second_half_sot,
+            [(1, 2), (config.MAX_SECOND_HALF_SHOTS_ON_TARGET, 1)],
+        )
+        score += second_half_sot_points
+        breakdown['second_half_sot'] = second_half_sot_points
+
         # 2.4 Last 15min shots ≤3 (+2 points)
-        if total_shots <= 8:
-            score += 2
-            breakdown['last_15min_shots'] = 2
-        else:
-            breakdown['last_15min_shots'] = 0
-        
+        if last_15min_shots == 0 and not events:
+            last_15min_shots = int(total_shots * 0.2)
+        last15_points = self.score_band(last_15min_shots, [(2, 2), (3, 1)])
+        score += last15_points
+        breakdown['last_15min_shots'] = last15_points
+
         # 2.5 2nd half corners ≤3 (+1 point)
-        second_half_corners = int(total_corners * 0.5)
-        if second_half_corners <= config.MAX_SECOND_HALF_CORNERS:
-            score += 1
-            breakdown['second_half_corners'] = 1
-        else:
-            breakdown['second_half_corners'] = 0
+        if second_half_corners == 0 and total_corners and not events:
+            second_half_corners = int(total_corners * 0.5)
+        second_half_corners_points = 1 if second_half_corners <= config.MAX_SECOND_HALF_CORNERS else 0
+        score += second_half_corners_points
+        breakdown['second_half_corners'] = second_half_corners_points
         
         # 2.6 2nd half possession diff ≤15% (+1 point)
         if poss_diff <= config.MAX_SECOND_HALF_POSSESSION_DIFF:
@@ -285,6 +432,7 @@ class MatchAnalyzer:
             breakdown['penalty_red_card'] = config.PENALTY_RED_CARD_WITH_PRESSURE
         
         # xG difference > 1.3
+        home_xg, away_xg = team_xg_split
         xg_diff = abs(home_xg - away_xg)
         if xg_diff > config.MAX_XG_DIFFERENCE:
             penalties += config.PENALTY_XG_DIFF
@@ -312,6 +460,31 @@ class MatchAnalyzer:
         breakdown['final_score'] = final_score
         
         return final_score, breakdown, bonus_tag
+
+    def calculate_stability_index(
+        self,
+        match_score: int,
+        effective_threshold: float,
+        risk_index: float,
+        tempo_metrics: Dict,
+    ) -> Tuple[float, float]:
+        """Combine score cushion, risk, and tempo pressure into a stability index."""
+        margin = match_score - effective_threshold
+        normalized_margin = max(0.0, min(1.0, margin / max(1.0, config.STABILITY_MARGIN_NORMALIZER)))
+
+        tempo_index = max(0.0, tempo_metrics.get('tempo_index', 0.0))
+        card_pressure = tempo_metrics.get('cards_recent', 0) / max(1, config.RISK_CARD_EVENTS_CAP)
+
+        raw_index = (
+            0.45
+            + normalized_margin
+            - risk_index * config.STABILITY_RISK_WEIGHT
+            - tempo_index * config.STABILITY_TEMPO_WEIGHT
+            - card_pressure * config.STABILITY_CARD_WEIGHT
+        )
+
+        stability_index = max(0.0, min(1.0, round(raw_index, 3)))
+        return stability_index, round(margin, 2)
     
     # ============ NEW HELPER METHODS FOR S4 & S5 ============
     
@@ -637,19 +810,39 @@ class MatchAnalyzer:
             return None  # Skip, already analyzed with same state
         
         # Calculate xG for both teams
-        combined_xg, _ = self.calculate_xg_from_stats(stats)
-        home_xg = combined_xg * 0.5  # Approximate
-        away_xg = combined_xg * 0.5
-        
+        combined_xg, second_half_xg, team_xg_split = self.calculate_xg_from_stats(stats)
+
         # Calculate match score (30-point system)
         match_score, score_breakdown, bonus_tag = self.calculate_match_score(
-            stats, events, goals, minute, home_xg, away_xg
+            stats,
+            events,
+            goals,
+            minute,
+            combined_xg,
+            second_half_xg,
+            team_xg_split,
         )
-        
+
+        # Tempo & risk evaluation (ensures lower threshold without losing control)
+        tempo_metrics = self.calculate_tempo_metrics(events or [], minute)
+        risk_index = self.calculate_risk_index(tempo_metrics)
+        score_breakdown['risk_index'] = risk_index
+        score_breakdown['risk_penalty'] = 0
+
+        if risk_index > config.MAX_RISK_INDEX:
+            self.logger.debug(
+                f"Match {fixture_id} rejected: risk index too high ({risk_index})"
+            )
+            return None
+
+        if risk_index > config.RISK_WARNING_THRESHOLD:
+            match_score = max(0, match_score - 1)
+            score_breakdown['risk_penalty'] = -1
+
         # S3: Team Form & Historical Data (Max 2 points)
         home_npxg = self.analyze_team_form(home_id)
         away_npxg = self.analyze_team_form(away_id)
-        
+
         if home_npxg <= config.MAX_TEAM_NPXG and away_npxg <= config.MAX_TEAM_NPXG:
             match_score += 1
             score_breakdown['team_form'] = 1
@@ -665,24 +858,81 @@ class MatchAnalyzer:
         
         # Apply temporal adjustment (minute-based tolerance)
         effective_threshold = config.REQUIRED_SCORE
-        if minute >= 80:
-            effective_threshold -= config.TOLERANCE_MINUTE_80
-        elif minute >= 70:
-            effective_threshold -= config.TOLERANCE_MINUTE_70
-        
+        threshold_adjustments: Dict[str, int] = {}
+
+        if minute >= 80 and config.TOLERANCE_MINUTE_80:
+            adjustment = config.TOLERANCE_MINUTE_80
+            effective_threshold -= adjustment
+            threshold_adjustments['minute_80'] = -adjustment
+        elif minute >= 70 and config.TOLERANCE_MINUTE_70:
+            adjustment = config.TOLERANCE_MINUTE_70
+            effective_threshold -= adjustment
+            threshold_adjustments['minute_70'] = -adjustment
+
+        if minute >= config.LATE_WINDOW_THRESHOLD_MINUTE:
+            adjustment = config.LATE_WINDOW_THRESHOLD_REDUCTION
+            if adjustment:
+                effective_threshold -= adjustment
+                threshold_adjustments['late_window'] = -adjustment
+
+        if risk_index <= config.LOW_RISK_RELAXATION_THRESHOLD:
+            adjustment = config.LOW_RISK_RELAXATION_DELTA
+            if adjustment:
+                effective_threshold -= adjustment
+                threshold_adjustments['low_risk'] = -adjustment
+
+        effective_threshold = max(config.MINIMUM_EFFECTIVE_THRESHOLD, effective_threshold)
+        score_breakdown['threshold_base'] = config.REQUIRED_SCORE
+        score_breakdown['threshold_adjustments'] = threshold_adjustments
+        score_breakdown['effective_threshold'] = effective_threshold
+
         # Check if match qualifies
         if match_score < effective_threshold:
             self.logger.debug(f"Match {fixture_id} failed score check: {match_score}/{config.MAX_TOTAL_SCORE} (threshold: {effective_threshold})")
             return None
-        
+
+        stability_index, stability_margin = self.calculate_stability_index(
+            match_score,
+            effective_threshold,
+            risk_index,
+            tempo_metrics,
+        )
+        score_breakdown['stability_index'] = stability_index
+        score_breakdown['stability_margin'] = stability_margin
+
+        if (
+            stability_index < config.MIN_STABILITY_INDEX
+            and stability_margin < config.STABILITY_MARGIN_RECOVERY
+        ):
+            self.logger.debug(
+                f"Match {fixture_id} rejected: unstable window (stability={stability_index:.2f}, margin={stability_margin:.2f})"
+            )
+            return None
+
         # Calculate confidence and classify
         confidence = match_score / config.MAX_TOTAL_SCORE
         classification = self.classify_confidence(confidence)
-        
+
+        if risk_index > config.RISK_WARNING_THRESHOLD and classification == "strong_candidate":
+            classification = "candidate"
+        elif risk_index > config.RISK_WARNING_THRESHOLD and classification == "candidate":
+            classification = "weak_candidate"
+
+        if classification == "strong_candidate" and stability_margin < config.STABILITY_STRONG_MARGIN:
+            classification = "candidate"
+        if classification == "candidate" and stability_index < (config.MIN_STABILITY_INDEX + 0.1):
+            classification = "weak_candidate"
+
+        if classification == "weak_candidate" and stability_index < config.MIN_STABILITY_INDEX:
+            self.logger.debug(
+                f"Match {fixture_id} rejected: weak candidate with low stability ({stability_index:.2f})"
+            )
+            return None
+
         if classification == "reject":
             self.logger.debug(f"Match {fixture_id} rejected: confidence too low ({confidence:.2f})")
             return None
-        
+
         # Update cache
         self.update_cache(fixture_id, score_str, minute, last_event_time, confidence)
         
@@ -698,20 +948,53 @@ class MatchAnalyzer:
             reasons.append("draw acceptance")
         if bonus_tag:
             reasons.append("early goals dead tempo")
-        
+        if risk_index <= 0.35:
+            reasons.append("tempo stabilized")
+        elif risk_index > config.RISK_WARNING_THRESHOLD:
+            reasons.append("tempo caution")
+        if stability_margin >= config.STABILITY_STRONG_MARGIN:
+            reasons.append("stability cushion")
+        elif stability_index < (config.MIN_STABILITY_INDEX + 0.1):
+            reasons.append("monitor pressure")
+
+        if 'late_window' in threshold_adjustments:
+            reasons.append("late window tolerance")
+        if 'low_risk' in threshold_adjustments:
+            reasons.append("low-risk cushion")
+
         # Extract detailed stats
         total_shots = self.extract_statistic(stats, 'Total Shots') or 0
         shots_on_target = self.extract_statistic(stats, 'Shots on Goal') or 0
         total_corners = self.extract_statistic(stats, 'Corner Kicks') or 0
         home_poss = self.extract_statistic(stats, 'Ball Possession', 0) or 50
         away_poss = self.extract_statistic(stats, 'Ball Possession', 1) or 50
-        _, second_half_xg = self.calculate_xg_from_stats(stats)
-        
-        # Last 10 min stats
-        xg_slope_last10 = self.calculate_xg_slope(events, minute)
-        shots_last10 = int(total_shots * 0.15)  # Approximate
-        corners_last10 = len([e for e in events if e.get('detail') == 'Corner' and e.get('time', {}).get('elapsed', 0) >= minute - 10]) if events else 0
-        
+        # Dynamic event stats for reporting
+        second_half_shots_count = self.count_events_in_range(events or [], 45, minute, self.is_shot_event)
+        if second_half_shots_count == 0 and not events:
+            second_half_shots_count = int(total_shots * 0.45)
+
+        second_half_sot_count = self.count_events_in_range(events or [], 45, minute, self.is_shot_on_target_event)
+        if second_half_sot_count == 0 and not events:
+            second_half_sot_count = int(shots_on_target * 0.5)
+
+        last_15min_shots_count = self.count_events_in_range(events or [], minute - 15, minute, self.is_shot_event)
+        if last_15min_shots_count == 0 and not events:
+            last_15min_shots_count = int(total_shots * 0.2)
+
+        shots_last10 = self.count_events_in_range(events or [], minute - 10, minute, self.is_shot_event)
+        on_target_last10 = self.count_events_in_range(events or [], minute - 10, minute, self.is_shot_on_target_event)
+        corners_last10 = self.count_events_in_range(
+            events or [],
+            minute - 10,
+            minute,
+            lambda e: str(e.get('detail', '')).lower() == 'corner',
+        )
+
+        if not events:
+            shots_last10 = int(total_shots * 0.15)
+            on_target_last10 = int(shots_on_target * 0.2)
+            corners_last10 = int(total_corners * 0.2)
+
         return {
             'fixture_id': fixture_id,
             'home_team': home_team.get('name', 'Unknown'),
@@ -722,10 +1005,12 @@ class MatchAnalyzer:
             'league_country': league.get('country', 'N/A'),
             'total_xg': combined_xg,
             'second_half_xg': second_half_xg,
+            'home_xg': team_xg_split[0],
+            'away_xg': team_xg_split[1],
             'total_shots': total_shots,
             'shots_on_target': shots_on_target,
-            'second_half_shots': int(total_shots * 0.5),
-            'last_15min_shots': 2 if total_shots <= 8 else 4,  # Estimate
+            'second_half_shots': second_half_shots_count,
+            'last_15min_shots': last_15min_shots_count,
             'total_corners': total_corners,
             'possession_diff': abs(home_poss - away_poss),
             'home_form_npxg': home_npxg,
@@ -736,15 +1021,28 @@ class MatchAnalyzer:
             'confidence': round(confidence, 2),
             'classification': classification,
             'reasons': reasons,
-            'score_breakdown': score_breakdown,
-            'stats': {
-                'xg_total': combined_xg,
-                'xg_last10': round(abs(xg_slope_last10), 2),
+            'risk_index': risk_index,
+            'stability_index': stability_index,
+              'stability_margin': stability_margin,
+              'tempo_metrics': tempo_metrics,
+              'score_breakdown': score_breakdown,
+              'thresholds': {
+                  'base': config.REQUIRED_SCORE,
+                  'effective': effective_threshold,
+                  'adjustments': threshold_adjustments,
+              },
+              'stats': {
+                  'xg_total': combined_xg,
+                'xg_last10': round(abs(tempo_metrics['xg_slope']), 2),
                 'shots_last10': shots_last10,
-                'on_target_last10': int(shots_on_target * 0.15),
+                'on_target_last10': on_target_last10,
                 'corners_last10': corners_last10,
                 'possession_diff': abs(home_poss - away_poss),
-                'possession_var_last10': 5,  # Placeholder
+                'risk_index': risk_index,
+                'tempo_index': tempo_metrics['tempo_index'],
+                'dangerous_actions_last10': tempo_metrics['dangerous_actions'],
+                'pressure_events_last10': tempo_metrics['pressure_events'],
+                'cards_last10': tempo_metrics['cards_recent'],
             },
             'tags': [bonus_tag] if bonus_tag else [],
         }

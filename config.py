@@ -30,9 +30,16 @@ MIN_MINUTE_EXTENDED = 58  # Extended range when low traffic
 MAX_MINUTE_EXTENDED = 75
 
 # Analysis Thresholds - UPGRADED 30-POINT SCORING SYSTEM
-# Total Score Required: ≥12 out of 30 points (relaxed for higher recall)
-REQUIRED_SCORE = 12  # Minimum score to trigger alert
+# Total Score Required: ≥10 out of 30 points (relaxed for higher recall)
+REQUIRED_SCORE = 10  # Minimum score to trigger alert
 MAX_TOTAL_SCORE = 30  # Maximum possible score
+MINIMUM_EFFECTIVE_THRESHOLD = 7  # Never reduce qualification below this score
+
+# Dynamic threshold relaxations to improve recall while respecting stability
+LATE_WINDOW_THRESHOLD_MINUTE = 67
+LATE_WINDOW_THRESHOLD_REDUCTION = 1
+LOW_RISK_RELAXATION_THRESHOLD = 0.32
+LOW_RISK_RELAXATION_DELTA = 1
 
 # Confidence Thresholds
 STRONG_CONFIDENCE = 0.70  # ≥70% = strong_candidate
@@ -99,6 +106,27 @@ TOLERANCE_MINUTE_80 = 2  # Reduce threshold by 2 points if minute ≥ 80
 
 # Cache Strategy (avoid duplicate analysis)
 CACHE_DELTA_CONFIDENCE = 0.06  # Re-alert only if Δconfidence ≥ 0.06
+
+# Risk Control & Tempo Weights
+MAX_RISK_INDEX = 0.65  # Hard rejection threshold
+RISK_WARNING_THRESHOLD = 0.48  # Downgrade classification if exceeded
+RISK_TEMPO_WEIGHT = 0.40
+RISK_PRESSURE_WEIGHT = 0.25
+RISK_CARD_WEIGHT = 0.20
+RISK_XG_SLOPE_WEIGHT = 0.15
+RISK_DANGEROUS_ACTIONS_CAP = 6  # Normalise tempo contribution
+RISK_PRESSURE_EVENTS_CAP = 5
+RISK_CARD_EVENTS_CAP = 3
+RISK_SLOPE_CAP = 0.25
+
+# Stability Guardrails (counterbalance lower threshold)
+STABILITY_MARGIN_NORMALIZER = 4  # Convert score margin into 0-1 contribution
+STABILITY_RISK_WEIGHT = 0.60
+STABILITY_TEMPO_WEIGHT = 0.50
+STABILITY_CARD_WEIGHT = 0.35
+MIN_STABILITY_INDEX = 0.30
+STABILITY_MARGIN_RECOVERY = 1.0
+STABILITY_STRONG_MARGIN = 2.5
 
 # Match Tracking
 MATCH_MEMORY_HOURS = 24
